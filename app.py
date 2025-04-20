@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Form
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Form, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response # Import Response for 204
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,19 +11,52 @@ import aiohttp
 import re
 import asyncio
 import pathlib
+import uuid
+import databases
+import datetime
+import traceback # Import traceback for logging
+from contextlib import asynccontextmanager
 from typing import List, AsyncGenerator, Optional, Dict, Set
 
 load_dotenv()
 
-# 创建 FastAPI 应用实例
-app = FastAPI()
+# --- Database Setup ---
+DATABASE_URL = "sqlite+aiosqlite:///./tasks.db"
+database = databases.Database(DATABASE_URL)
+
+CREATE_TABLE_QUERY = """
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    original_filename TEXT,
+    status TEXT NOT NULL, -- 'pending', 'processing', 'completed', 'failed'
+    progress INTEGER DEFAULT 0, -- 进度百分比 (0-100)
+    result TEXT, -- 存储翻译结果 (如果成功)
+    error_message TEXT, -- 存储错误信息 (如果失败)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 应用启动时
+    await database.connect()
+    await database.execute(query=CREATE_TABLE_QUERY)
+    print("Database connected and table ensured.")
+    yield
+    # 应用关闭时
+    await database.disconnect()
+    print("Database disconnected.")
+
+# 创建 FastAPI 应用实例, 并关联 lifespan 事件
+app = FastAPI(lifespan=lifespan)
 
 # 添加CORS中间件，允许前端进行API调用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 允许所有来源
     allow_credentials=True,
-    allow_methods=["*"],  # 允许所有方法
+    allow_methods=["*"],  # 允许所有方法 (including DELETE)
     allow_headers=["*"],  # 允许所有头
 )
 
@@ -34,7 +67,7 @@ templates = Jinja2Templates(directory="templates")
 # xAI API配置
 XAI_API_KEY = os.getenv("XAI_API_KEY", "") # 从 .env 读取 API Key
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-3-mini-fast-beta") # 从 .env 读取模型，默认为 fast-beta
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-3-fast-beta") # 从 .env 读取模型，默认为 fast-beta
 
 print(f"Using xAI Model: {XAI_MODEL}") # 启动时打印使用的模型
 
@@ -449,21 +482,61 @@ async def translate_with_xai_async(prompt: str, max_retries: int = 3, initial_de
             return f"翻译失败: 未知错误 - {str(e_outer)}"
 
 
-async def translate_srt(srt_content: str, filename: str, display_mode: str = "only_translated", user_terms_list: List[str] = []) -> str:
-    """Translates an SRT file content using xAI API (non-streaming). Optionally uses custom terms."""
+async def update_task_progress(db: databases.Database, task_id: str, progress: int):
+    """Helper function to update task progress in the database."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    query = """
+        UPDATE tasks
+        SET progress = :progress, updated_at = :now
+        WHERE task_id = :task_id
+    """
+    try:
+        # Ensure database is connected before executing
+        if not db.is_connected:
+            await db.connect() # Connect if not already connected (consider lifespan management)
+        await db.execute(query=query, values={"progress": progress, "now": now, "task_id": task_id})
+    except Exception as e:
+        print(f"Error updating progress for task {task_id}: {e}")
+        # Consider re-raising or logging more formally
+
+async def translate_srt(
+    task_id: str, # Added task_id
+    db: databases.Database, # Added database instance
+    srt_content: str,
+    filename: str,
+    display_mode: str = "only_translated",
+    user_terms_list: List[str] = []
+) -> str:
+    """Translates an SRT file content using xAI API (non-streaming), updates progress, and returns the final SRT string."""
     subtitles = parse_srt(srt_content)
+    total_subtitles = len(subtitles)
     if not subtitles:
-        return "错误：无法解析SRT文件或文件为空。"
+        # Raise an exception instead of returning a string for better error handling in background task
+        raise ValueError("错误：无法解析SRT文件或文件为空。")
+
     translated_subtitles = []
     video_title = pathlib.Path(filename).stem
 
     # Term extraction and merging (similar to stream version)
-    ai_extracted_terms = await extract_terms(srt_content, video_title)
+    # Consider if term extraction itself should report progress or be part of step 0
+    try:
+        ai_extracted_terms = await extract_terms(srt_content, video_title)
+    except Exception as term_err:
+        print(f"Warning: Term extraction failed for task {task_id}: {term_err}")
+        ai_extracted_terms = [] # Continue without AI terms if extraction fails
+
     cleaned_user_terms = set(term.strip() for term in user_terms_list if term.strip())
     cleaned_ai_terms = set(term.strip() for term in ai_extracted_terms if term.strip())
     combined_terms_set = cleaned_ai_terms | cleaned_user_terms
     combined_terms_list = sorted(list(combined_terms_set), key=str.lower)
     special_terms_str = "\n".join([f"- {term}" for term in combined_terms_list]) if combined_terms_list else "无"
+
+    # Update progress after term extraction (optional, e.g., 5% done)
+    await update_task_progress(db, task_id, 5)
+
+    last_reported_progress = 5
+    progress_update_interval = 1 # Update DB every subtitle for simplicity, adjust if needed for performance
+    # progress_update_threshold = 5 # Update DB every 5% change - alternative strategy
 
     for i, subtitle in enumerate(subtitles):
         # Use the correct SRT index for context gathering
@@ -482,11 +555,20 @@ async def translate_srt(srt_content: str, filename: str, display_mode: str = "on
         )
 
         # Use non-streaming async function
-        response_text = await translate_with_xai_async(prompt)
+        try:
+            response_text = await translate_with_xai_async(prompt) # This might still take time
+        except Exception as api_err:
+             # If API call fails, maybe fail the whole task? Or just mark this subtitle?
+             print(f"Error calling translation API for task {task_id}, subtitle {subtitle['index']}: {api_err}")
+             # Raise the error to be caught by run_translation_task
+             raise api_err # Re-raise to fail the background task
 
         translated_text = ""
         if response_text.startswith("翻译失败"):
+            # Consider how to handle partial failures - maybe store a warning?
+            # For now, treat it as text to be included.
             translated_text = response_text # Keep error message
+            print(f"Warning: Translation API indicated failure for task {task_id}, subtitle {subtitle['index']}: {response_text}")
         else:
             try:
                 # Attempt to extract <r> tag first
@@ -498,9 +580,11 @@ async def translate_srt(srt_content: str, filename: str, display_mode: str = "on
                     # If no <r> tag, use the whole response
                     translated_text = response_text.strip()
                     if not translated_text:
-                        translated_text = "翻译成功但无有效内容"
+                        translated_text = "[翻译成功但无有效内容]" # Make it clear
             except Exception as e:
-                translated_text = f"翻译成功但解析结果失败: {str(e)}"
+                 # Log this specific parsing error?
+                print(f"Error parsing translation result for task {task_id}, subtitle {subtitle['index']}: {e}")
+                translated_text = f"[翻译成功但解析结果失败: {str(e)}]"
 
         translated_subtitles.append({
             "index": subtitle['index'],
@@ -508,6 +592,19 @@ async def translate_srt(srt_content: str, filename: str, display_mode: str = "on
             "original": subtitle['text'],
             "translated": translated_text
         })
+
+        # --- Progress Update Logic ---
+        # Calculate progress based on processed subtitles (starting after term extraction)
+        # Scale 0-100% of subtitles processing to 5-99% of overall progress
+        current_progress = 5 + int(((i + 1) / total_subtitles) * 94)
+        current_progress = min(current_progress, 99) # Cap at 99 until final build
+
+        # Update progress in DB frequently
+        if current_progress >= last_reported_progress + progress_update_interval:
+             await update_task_progress(db, task_id, current_progress)
+             last_reported_progress = current_progress
+        # --- End Progress Update ---
+
 
     # Build final SRT output
     output_srt = ""
@@ -517,12 +614,14 @@ async def translate_srt(srt_content: str, filename: str, display_mode: str = "on
         if display_mode == "only_translated":
             output_srt += f"{sub['translated']}\n\n"
         elif display_mode == "original_above_translated":
-            output_srt += f"{sub['original']}\n"
-            output_srt += f"{sub['translated']}\n\n"
+            output_srt += f"{sub['original']}\n{sub['translated']}\n\n"
         elif display_mode == "translated_above_original":
-            output_srt += f"{sub['translated']}\n"
-            output_srt += f"{sub['original']}\n\n"
-    return output_srt
+            output_srt += f"{sub['translated']}\n{sub['original']}\n\n"
+        else: # Default to only translated
+             output_srt += f"{sub['translated']}\n\n"
+
+    # No need to update progress to 100 here, run_translation_task will do it upon success.
+    return output_srt.strip() # Return stripped result
 
 
 async def translate_srt_stream(srt_content: str, filename: str, display_mode: str = "only_translated", user_terms_list: List[str] = []):
@@ -668,132 +767,515 @@ async def translate_srt_stream(srt_content: str, filename: str, display_mode: st
     yield json.dumps({"type": "complete", "message": "翻译完成"}) + "\n"
 
 
-# WebUI 路由
+# --- Background Task Function ---
+
+async def run_translation_task(
+    task_id: str,
+    srt_content: str,
+    filename: str,
+    display_mode: str,
+    user_terms_list: List[str]
+):
+    """The actual background task that performs translation and updates DB."""
+    print(f"Starting background task: {task_id} for file {filename}")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Ensure DB connection for the background task if needed (lifespan handles main process)
+    # It's generally better practice if the background task can rely on the lifespan
+    # manager having connected the DB, but we add a check just in case.
+    is_db_connected_locally = False
+    if not database.is_connected:
+        print(f"Warning: Database not connected at start of task {task_id}. Attempting to connect.")
+        try:
+            await database.connect()
+            is_db_connected_locally = True
+        except Exception as db_conn_err:
+            print(f"FATAL: Could not connect database for task {task_id}: {db_conn_err}")
+            # Cannot proceed without DB, maybe try to update status if possible? Unlikely.
+            return # Exit task
+
+    # 1. Update status to 'processing'
+    update_query = """
+        UPDATE tasks SET status = :status, updated_at = :now
+        WHERE task_id = :task_id AND status = 'pending'
+    """ # Add check for pending status
+    try:
+        await database.execute(query=update_query, values={"status": "processing", "now": now, "task_id": task_id})
+        print(f"Task {task_id} status set to processing.")
+    except Exception as e:
+        print(f"Error setting task {task_id} to processing: {e}")
+        # If we connected locally, try to disconnect
+        if is_db_connected_locally: await database.disconnect()
+        return # Stop if we can't even set it to processing
+
+    # 2. Perform translation
+    try:
+        translated_srt = await translate_srt(
+            task_id=task_id,
+            db=database, # Pass the database instance
+            srt_content=srt_content,
+            filename=filename,
+            display_mode=display_mode,
+            user_terms_list=user_terms_list
+        )
+        # 3a. Update status to 'completed' on success
+        now = datetime.datetime.now(datetime.timezone.utc)
+        completion_query = """
+            UPDATE tasks
+            SET status = :status, progress = :progress, result = :result, updated_at = :now
+            WHERE task_id = :task_id
+        """
+        await database.execute(
+            query=completion_query,
+            values={
+                "status": "completed",
+                "progress": 100, # Set final progress
+                "result": translated_srt,
+                "now": now,
+                "task_id": task_id
+            }
+        )
+        print(f"Task {task_id} completed successfully.")
+
+    except Exception as e:
+        # 3b. Update status to 'failed' on error
+        print(f"Error during translation task {task_id}: {e}")
+        # import traceback # Log full traceback for background errors - Already imported
+        traceback.print_exc()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        error_query = """
+            UPDATE tasks
+            SET status = :status, error_message = :error, updated_at = :now
+            WHERE task_id = :task_id
+        """
+        # Ensure error message is not too long for DB if there's a limit
+        error_message = traceback.format_exc() # Store full traceback
+        error_message = error_message[:2000] # Limit length if necessary
+        try:
+            await database.execute(
+                query=error_query,
+                values={"status": "failed", "error": error_message, "now": now, "task_id": task_id}
+            )
+            print(f"Task {task_id} failed, status updated.")
+        except Exception as db_err:
+             print(f"CRITICAL: Failed to update task {task_id} status to failed after error: {db_err}")
+
+
+    finally:
+        # If this task instance connected the DB, disconnect it
+        if is_db_connected_locally and database.is_connected:
+            await database.disconnect()
+            print(f"Task {task_id} disconnected its local DB connection.")
+
+
+# --- WebUI Routes ---
+
 @app.get("/", response_class=HTMLResponse)
 async def get_home(request: Request):
+    # Optionally fetch recent tasks to display?
     return templates.TemplateResponse("index.html", {"request": request})
 
-# /upload route handles form submission from index.html
-@app.post("/upload", response_class=HTMLResponse)
+@app.get("/stream.html", response_class=HTMLResponse)
+async def get_stream_page(request: Request):
+    """Serves the stream.html template page."""
+    # This route simply renders the template.
+    # The actual data fetching and streaming is handled by JavaScript
+    # within stream.html making requests to /api/translate-stream.
+    return templates.TemplateResponse("stream.html", {"request": request})
+
+# /upload route handles SINGLE file submission for background processing
+@app.post("/upload", response_class=JSONResponse) # Return JSON with task ID
 async def upload_file(
-    request: Request,
+    # request: Request, # Removed as it's not used directly here anymore
+    background_tasks: BackgroundTasks, # Inject BackgroundTasks
     file: UploadFile = File(...),
     display_mode: str = Form("only_translated"),
-    stream: Optional[bool] = Form(False),
-    custom_terms: Optional[str] = Form(None) # Receive custom terms from form
+    stream: Optional[bool] = Form(False), # Keep stream param for now, but ignore if False
+    custom_terms: Optional[str] = Form(None)
 ):
+    # --- Handle Streaming Separately (Original Logic - kept for reference/potential future use) ---
+    # Note: If keeping this, 'request: Request' needs to be added back to signature
+    # if stream:
+    #     try:
+    #         contents = await file.read()
+    #         srt_content = None
+    #         # ... (decoding logic remains the same) ...
+    #         encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'big5', 'shift_jis']
+    #         for encoding in encodings_to_try:
+    #             try: srt_content = contents.decode(encoding); break
+    #             except UnicodeDecodeError: continue
+    #         if srt_content is None: raise ValueError("无法解码SRT文件内容。")
+    #         # Render stream.html for streaming response
+    #         # return templates.TemplateResponse("stream.html", {"request": request, ...}) # Needs request object
+    #         # For now, let's explicitly state background tasks don't use stream=True here
+    #         raise HTTPException(status_code=400, detail="后台任务处理不支持 stream=True，请使用非流式上传或专门的流式端点。")
+    #     except Exception as e_stream:
+    #          print(f"Error during initial processing for streaming request: {e_stream}")
+    #          raise HTTPException(status_code=500, detail=f"处理流式请求时出错: {e_stream}")
+
+    # --- Background Task Logic ---
+    if stream:
+        # Explicitly reject stream=True for this background task endpoint
+         raise HTTPException(status_code=400, detail="后台任务处理不支持 stream=True 参数。请勿选中“流式输出”选项进行后台任务提交。")
+
+    task_id = str(uuid.uuid4())
+    filename = file.filename if file.filename else "unknown_file.srt"
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # Ensure DB is connected via lifespan before proceeding
+    if not database.is_connected:
+         print("ERROR: Database is not connected in /upload endpoint.")
+         raise HTTPException(status_code=500, detail="服务器内部错误：数据库未连接。")
+
     try:
         contents = await file.read()
         srt_content = None
-        detected_encoding = "utf-8" # Default
-
         # Attempt decoding with common encodings
         encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'big5', 'shift_jis']
         for encoding in encodings_to_try:
             try:
                 srt_content = contents.decode(encoding)
-                detected_encoding = encoding
-                print(f"Successfully decoded with {encoding}")
+                print(f"Successfully decoded {filename} with {encoding}")
                 break
             except UnicodeDecodeError:
                 continue
 
         if srt_content is None:
-             raise ValueError("无法解码SRT文件内容，请确保文件编码正确。")
+             # Return error JSON instead of rendering error page
+             raise HTTPException(status_code=400, detail="无法解码SRT文件内容，请确保文件编码正确。")
 
-        if stream:
-            # Render stream.html, passing necessary data including custom terms
-            return templates.TemplateResponse(
-                "stream.html",
-                {
-                    "request": request,
-                    "filename": file.filename,
-                    "display_mode": display_mode,
-                    "srt_content": srt_content,
-                    "custom_terms": custom_terms or "" # Pass custom terms string
-                }
-            )
-        else:
-            # Non-streaming translation
-            # Parse custom terms for non-streaming translation as well
-            user_terms_list = [term.strip() for term in custom_terms.splitlines() if term.strip()] if custom_terms else []
-            translated_srt = await translate_srt(
-                srt_content,
-                file.filename,
-                display_mode,
-                user_terms_list=user_terms_list # Pass terms to non-streaming function
-            )
-            filename_dl = f"translated_{file.filename}"
-            return templates.TemplateResponse(
-                "result.html",
-                {
-                    "request": request,
-                    "translated_text": translated_srt,
-                    "original_filename": file.filename,
-                    "translated_filename": filename_dl
-                }
-            )
-    except Exception as e:
-        print(f"Upload error: {e}")
-        # Optionally log the full traceback here
-        # import traceback
-        # traceback.print_exc()
-        return templates.TemplateResponse(
-            "error.html",
-            {"request": request, "error": str(e)}
-        )
-
-
-# API Endpoints (less critical for UI functionality but good practice)
-
-@app.post("/api/translate", response_class=JSONResponse)
-async def translate_endpoint(
-    file: UploadFile = File(...),
-    display_mode: str = Form("only_translated"),
-    custom_terms: Optional[str] = Form(None) # Add custom terms here too
-):
-    """API endpoint for translating SRT file (non-streaming)."""
-    try:
-        contents = await file.read()
-        srt_content = None
-        # ... (decoding logic as in /upload) ...
-        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'big5', 'shift_jis']
-        for encoding in encodings_to_try:
-            try: srt_content = contents.decode(encoding); break
-            except UnicodeDecodeError: continue
-        if srt_content is None: raise HTTPException(status_code=400, detail="无法解码SRT文件内容。")
-
+        # Parse custom terms
         user_terms_list = [term.strip() for term in custom_terms.splitlines() if term.strip()] if custom_terms else []
-        # Call translate_srt with custom terms
-        translated_srt = await translate_srt(srt_content, file.filename, display_mode, user_terms_list=user_terms_list)
-        return JSONResponse(content={"translated_srt": translated_srt})
+
+        # Insert initial task record into DB
+        insert_query = """
+            INSERT INTO tasks (task_id, original_filename, status, progress, created_at, updated_at)
+            VALUES (:task_id, :filename, :status, :progress, :now, :now)
+        """
+        await database.execute(
+            query=insert_query,
+            values={
+                "task_id": task_id,
+                "filename": filename,
+                "status": "pending",
+                "progress": 0,
+                "now": now
+            }
+        )
+        print(f"Task {task_id} created for {filename}")
+
+        # Add the translation job to background tasks
+        background_tasks.add_task(
+            run_translation_task,
+            task_id=task_id,
+            srt_content=srt_content, # Pass content directly
+            filename=filename,
+            display_mode=display_mode,
+            user_terms_list=user_terms_list
+        )
+        print(f"Task {task_id} added to background queue.")
+
+        # Return the task ID to the client
+        return JSONResponse(content={"tasks": [{"filename": filename, "task_id": task_id}]})
+
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions directly
+        print(f"HTTP Exception during upload for {filename}: {http_exc.detail}")
+        raise http_exc
     except Exception as e:
-        # Log the error server-side for API calls as well
-        print(f"API /api/translate error: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        print(f"Error processing upload for {filename}: {e}")
+        # import traceback # Already imported
+        traceback.print_exc()
+        # Attempt to mark task as failed if DB record was created? Difficult here.
+        # Return a generic server error response
+        raise HTTPException(status_code=500, detail=f"处理上传文件时发生未知错误。")
 
 
-@app.post("/api/translate-stream")
+# --- Multi-file Upload Endpoint ---
+@app.post("/upload-multiple", response_class=JSONResponse)
+async def upload_multiple_files(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    display_mode: str = Form("only_translated"),
+    custom_terms: Optional[str] = Form(None)
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="没有提供任何文件。")
+
+    # Ensure DB is connected
+    if not database.is_connected:
+         print("ERROR: Database is not connected in /upload-multiple endpoint.")
+         raise HTTPException(status_code=500, detail="服务器内部错误：数据库未连接。")
+
+    created_tasks = []
+    user_terms_list = [term.strip() for term in custom_terms.splitlines() if term.strip()] if custom_terms else []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    insert_query = """
+        INSERT INTO tasks (task_id, original_filename, status, progress, created_at, updated_at)
+        VALUES (:task_id, :filename, :status, :progress, :now, :now)
+    """
+
+    for file in files:
+        task_id = str(uuid.uuid4())
+        filename = file.filename if file.filename else f"unknown_file_{task_id[:8]}.srt"
+
+        try:
+            contents = await file.read()
+            srt_content = None
+            # Attempt decoding
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'big5', 'shift_jis']
+            for encoding in encodings_to_try:
+                try:
+                    srt_content = contents.decode(encoding)
+                    print(f"Successfully decoded {filename} with {encoding}")
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if srt_content is None:
+                print(f"Warning: Could not decode file {filename}. Skipping.")
+                # Optionally create a failed task record?
+                # await database.execute(insert_query, values={... status='failed', error='decode error'...})
+                continue # Skip this file
+
+            # Insert initial task record
+            await database.execute(
+                query=insert_query,
+                values={
+                    "task_id": task_id,
+                    "filename": filename,
+                    "status": "pending",
+                    "progress": 0,
+                    "now": now
+                }
+            )
+            print(f"Task {task_id} created for {filename}")
+
+            # Add background task
+            background_tasks.add_task(
+                run_translation_task,
+                task_id=task_id,
+                srt_content=srt_content,
+                filename=filename,
+                display_mode=display_mode,
+                user_terms_list=user_terms_list
+            )
+            print(f"Task {task_id} added to background queue.")
+            created_tasks.append({"filename": filename, "task_id": task_id})
+
+        except Exception as e:
+            print(f"Error processing file {filename} during multi-upload: {e}")
+            traceback.print_exc()
+            # Decide if one failed file should stop the whole batch?
+            # For now, we just skip the failed file and continue.
+            # Optionally create a failed task record here too.
+
+    if not created_tasks:
+         raise HTTPException(status_code=400, detail="所有文件处理失败或无法解码。")
+
+    return JSONResponse(content={"tasks": created_tasks})
+
+
+# --- Task Status Endpoint ---
+@app.get("/task/{task_id}", response_class=JSONResponse)
+async def get_task_status(task_id: str):
+    """Fetches the status and result (if available) of a background task."""
+    if not database.is_connected:
+        print("ERROR: Database is not connected in /task/{task_id} endpoint.")
+        raise HTTPException(status_code=500, detail="服务器内部错误：数据库未连接。")
+
+    query = "SELECT task_id, original_filename, status, progress, result, error_message, created_at, updated_at FROM tasks WHERE task_id = :task_id"
+    result = await database.fetch_one(query=query, values={"task_id": task_id})
+
+    if not result:
+        raise HTTPException(status_code=404, detail="任务未找到。")
+
+    # Convert RowProxy to a mutable dictionary
+    task_data = dict(result._mapping) # Use ._mapping for mutable dict
+
+    # --- Robust Timestamp Formatting ---
+    for key in ['created_at', 'updated_at']:
+        timestamp_val = task_data.get(key)
+        print(f"Task {task_id}: Processing timestamp key '{key}', value: '{timestamp_val}', type: {type(timestamp_val)}") # Debug log
+
+        if timestamp_val is None:
+            task_data[key] = None # Keep None as None
+            continue
+
+        if isinstance(timestamp_val, datetime.datetime):
+            # Already a datetime object, format directly
+            try:
+                task_data[key] = timestamp_val.isoformat()
+                print(f"Task {task_id}: Formatted datetime object for '{key}' to ISO string.")
+            except Exception as e:
+                print(f"Error formatting datetime object for key '{key}': {e}")
+                task_data[key] = str(timestamp_val) # Fallback to string representation
+        elif isinstance(timestamp_val, str):
+            # It's a string, try parsing
+            parsed_dt = None
+            # Try common formats
+            formats_to_try = [
+                "%Y-%m-%d %H:%M:%S",         # Common SQLite format
+                "%Y-%m-%dT%H:%M:%S",        # ISO format without microseconds/timezone
+                "%Y-%m-%d %H:%M:%S.%f",      # With microseconds
+                "%Y-%m-%dT%H:%M:%S.%f",     # ISO format with microseconds
+                # Add more formats if needed, e.g., with timezone info if present
+            ]
+            # Also try fromisoformat as a fallback for standard ISO strings
+            try:
+                 # Handle potential 'Z' or timezone offsets if fromisoformat supports them
+                 # Replace space only if T is not already present
+                 iso_str = timestamp_val
+                 if 'T' not in iso_str and ' ' in iso_str:
+                      iso_str = iso_str.replace(" ", "T", 1)
+                 parsed_dt = datetime.datetime.fromisoformat(iso_str)
+                 print(f"Task {task_id}: Parsed timestamp string for '{key}' using fromisoformat.")
+            except ValueError:
+                 # fromisoformat failed, try strptime with common formats
+                 for fmt in formats_to_try:
+                     try:
+                         parsed_dt = datetime.datetime.strptime(timestamp_val, fmt)
+                         print(f"Task {task_id}: Parsed timestamp string for '{key}' using strptime format '{fmt}'.")
+                         break # Stop trying formats once one works
+                     except ValueError:
+                         continue # Try next format
+
+            if parsed_dt:
+                try:
+                    task_data[key] = parsed_dt.isoformat()
+                    print(f"Task {task_id}: Formatted parsed datetime for '{key}' to ISO string.")
+                except Exception as e:
+                    print(f"Error formatting parsed datetime for key '{key}': {e}")
+                    task_data[key] = timestamp_val # Fallback to original string
+            else:
+                print(f"Warning: Could not parse timestamp string '{timestamp_val}' for key '{key}' with any known format. Leaving as original string.")
+                # Keep the original string if all parsing fails
+        else:
+            # Unexpected type
+            print(f"Warning: Unexpected type for timestamp key '{key}' ({type(timestamp_val)}) in task {task_id}. Converting to string.")
+            task_data[key] = str(timestamp_val) # Fallback to string representation
+    # --- End Robust Timestamp Formatting ---
+
+
+    # Don't return the full result unless completed
+    if task_data.get('status') != 'completed':
+        task_data.pop('result', None) # Remove result if not completed
+
+    return JSONResponse(content=task_data)
+
+# --- New Endpoint to List Tasks ---
+@app.get("/tasks", response_class=JSONResponse)
+async def list_tasks():
+    """Lists all tasks from the database, ordered by creation time."""
+    if not database.is_connected:
+        print("ERROR: Database is not connected in /tasks endpoint.")
+        raise HTTPException(status_code=500, detail="服务器内部错误：数据库未连接。")
+
+    # Fetch all tasks, ordered by creation time descending (newest first)
+    # Limit the number of tasks returned if needed (e.g., LIMIT 50)
+    query = "SELECT task_id, original_filename, status, progress, error_message, created_at, updated_at FROM tasks ORDER BY created_at DESC"
+    results = await database.fetch_all(query=query)
+
+    tasks_list = []
+    for result in results:
+        task_data = dict(result._mapping) # Convert to mutable dict
+
+        # Format timestamps (reuse the robust logic)
+        for key in ['created_at', 'updated_at']:
+            timestamp_val = task_data.get(key)
+            if timestamp_val is None:
+                task_data[key] = None
+                continue
+            if isinstance(timestamp_val, datetime.datetime):
+                try: task_data[key] = timestamp_val.isoformat()
+                except Exception: task_data[key] = str(timestamp_val)
+            elif isinstance(timestamp_val, str):
+                parsed_dt = None
+                formats_to_try = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"]
+                try:
+                    iso_str = timestamp_val
+                    if 'T' not in iso_str and ' ' in iso_str: iso_str = iso_str.replace(" ", "T", 1)
+                    parsed_dt = datetime.datetime.fromisoformat(iso_str)
+                except ValueError:
+                    for fmt in formats_to_try:
+                        try: parsed_dt = datetime.datetime.strptime(timestamp_val, fmt); break
+                        except ValueError: continue
+                if parsed_dt:
+                    try: task_data[key] = parsed_dt.isoformat()
+                    except Exception: task_data[key] = timestamp_val
+                # else: keep original string if parsing failed
+            else:
+                task_data[key] = str(timestamp_val)
+
+        # Don't include full result or error message in the list view
+        task_data.pop('result', None)
+        # Keep error_message for failed tasks, maybe truncate it?
+        # if task_data.get('status') == 'failed' and task_data.get('error_message'):
+        #     task_data['error_message'] = task_data['error_message'][:100] + '...' # Truncate
+
+        tasks_list.append(task_data)
+
+    return JSONResponse(content={"tasks": tasks_list})
+
+# --- New Endpoint to Delete a Task ---
+@app.delete("/task/{task_id}", status_code=204)
+async def delete_task(task_id: str):
+    """Deletes a specific task from the database."""
+    if not database.is_connected:
+        print("ERROR: Database is not connected in DELETE /task/{task_id} endpoint.")
+        raise HTTPException(status_code=500, detail="服务器内部错误：数据库未连接。")
+
+    # First, check if the task exists
+    check_query = "SELECT 1 FROM tasks WHERE task_id = :task_id"
+    exists = await database.fetch_one(query=check_query, values={"task_id": task_id})
+
+    if not exists:
+        print(f"Attempted to delete non-existent task: {task_id}")
+        raise HTTPException(status_code=404, detail="任务未找到。")
+
+    # If it exists, delete it
+    delete_query = "DELETE FROM tasks WHERE task_id = :task_id"
+    try:
+        await database.execute(query=delete_query, values={"task_id": task_id})
+        print(f"Successfully deleted task: {task_id}")
+        # Return Response with 204 status code upon successful deletion
+        return Response(status_code=204)
+    except Exception as e:
+        print(f"Error deleting task {task_id}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"删除任务时发生服务器内部错误。")
+
+
+# --- API Endpoint for Actual Streaming ---
+# Note: The /stream-page route has been removed. Navigation is now directly to stream.html.
+# The JavaScript in stream.html handles fetching parameters from sessionStorage and
+# making the POST request to this endpoint.
+@app.post("/api/translate-stream") # Keep as POST for now to receive file content easily
 async def translate_stream_endpoint(
     file: UploadFile = File(...),
     display_mode: str = Form("only_translated"),
     custom_terms: Optional[str] = Form(None) # Receive custom terms
 ):
-    """API endpoint for streaming translation of SRT file."""
+    """API endpoint for streaming translation of SRT file. Called by stream.html JS."""
+    print(f"Received stream request for file: {file.filename}")
     try:
         contents = await file.read()
         srt_content = None
         # ... (decoding logic as in /upload) ...
         encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'gbk', 'big5', 'shift_jis']
         for encoding in encodings_to_try:
-            try: srt_content = contents.decode(encoding); break
-            except UnicodeDecodeError: continue
+            try:
+                srt_content = contents.decode(encoding)
+                print(f"Stream API: Decoded {file.filename} with {encoding}")
+                break
+            except UnicodeDecodeError:
+                continue
         if srt_content is None:
              async def error_stream(): yield json.dumps({"type": "error", "message": "无法解码SRT文件内容。"}) + "\n"
              return StreamingResponse(error_stream(), media_type="text/event-stream")
 
         # Parse custom terms string into a list, clean them
         user_terms_list = [term.strip() for term in custom_terms.splitlines() if term.strip()] if custom_terms else []
+        print(f"Stream API: Using display_mode={display_mode}, terms={user_terms_list}")
 
         # Pass user_terms_list to the generator
         return StreamingResponse(
@@ -803,22 +1285,40 @@ async def translate_stream_endpoint(
     except Exception as e:
         # Log the error server-side for API calls as well
         print(f"API /api/translate-stream error: {e}")
+        traceback.print_exc()
         async def error_stream(): yield json.dumps({"type": "error", "message": f"处理流请求时出错: {str(e)}"}) + "\n"
         return StreamingResponse(error_stream(), media_type="text/event-stream")
+
+
+# --- Deprecated Direct API Translate Endpoint ---
+@app.post("/api/translate", response_class=JSONResponse)
+async def translate_endpoint(
+    file: UploadFile = File(...),
+    display_mode: str = Form("only_translated"),
+    custom_terms: Optional[str] = Form(None) # Add custom terms here too
+):
+    """(Deprecated) API endpoint for translating SRT file (non-streaming)."""
+    raise HTTPException(status_code=501, detail="Direct API translation endpoint is disabled; use /upload or /stream-page.")
 
 
 # Download Endpoint
 @app.post("/download")
 async def download_translation(translated_text: str = Form(...), filename: str = Form(...)):
-    # Sanitize filename more thoroughly
-    # Remove directory separators and limit length
-    safe_filename = re.sub(r'[/\\]', '', filename) # Remove slashes
+    # New filename logic: basename-ch.srt
+    original_path = pathlib.Path(filename)
+    base_name = original_path.stem # Get filename without extension
+    new_filename = f"{base_name}-ch.srt"
+
+    # Sanitize the new filename
+    safe_filename = re.sub(r'[/\\]', '', new_filename) # Remove slashes
     safe_filename = re.sub(r'[^\w\.\-]', '_', safe_filename) # Replace other invalid chars
     safe_filename = safe_filename[:100] # Limit length
+    # Ensure it ends with .srt (should already, but double-check)
     if not safe_filename.lower().endswith(".srt"):
-         safe_filename += ".srt" # Ensure .srt extension
-    if not safe_filename or safe_filename == ".srt":
-        safe_filename = "translated_download.srt"
+         safe_filename = pathlib.Path(safe_filename).stem + ".srt"
+    # Handle empty or invalid base names
+    if not safe_filename or safe_filename == "-ch.srt" or safe_filename == ".srt":
+        safe_filename = "translated_output-ch.srt" # Fallback filename
 
     # Encode the text to UTF-8 bytes for the response body
     response_body = translated_text.encode('utf-8')

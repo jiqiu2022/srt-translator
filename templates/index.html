@@ -10,14 +10,17 @@
     <div class="container">
         <h1>SRT字幕翻译工具</h1>
         <p>上传SRT字幕文件，将自动翻译为中文</p>
-        
-        <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+
+        <!-- Removed action and method, added id -->
+        <form id="upload-form" enctype="multipart/form-data" class="upload-form">
             <div class="file-input-container">
-                <label for="file" class="file-label">选择SRT文件</label>
-                <input type="file" id="file" name="file" accept=".srt" required>
+                <!-- Updated label text -->
+                <label for="file" class="file-label">选择SRT文件（可多选）</label>
+                <!-- Added multiple attribute -->
+                <input type="file" id="file" name="files" accept=".srt" required multiple>
                 <span id="file-name">未选择文件</span>
             </div>
-            
+
             <div class="options-container">
                 <h3>显示模式：</h3>
                 <div class="radio-group">
@@ -25,21 +28,21 @@
                         <input type="radio" id="only_translated" name="display_mode" value="only_translated" checked>
                         <label for="only_translated">仅显示翻译</label>
                     </div>
-                    
+
                     <div class="radio-item">
                         <input type="radio" id="original_above_translated" name="display_mode" value="original_above_translated">
                         <label for="original_above_translated">原文在上，译文在下</label>
                     </div>
-                    
+
                     <div class="radio-item">
                         <input type="radio" id="translated_above_original" name="display_mode" value="translated_above_original">
                         <label for="translated_above_original">译文在上，原文在下</label>
                     </div>
                 </div>
-                
+
                 <div class="checkbox-item">
                     <input type="checkbox" id="stream" name="stream" value="true">
-                    <label for="stream">使用流式翻译（实时显示翻译进度）</label>
+                    <label for="stream">使用流式翻译（实时显示翻译进度，仅限单文件）</label>
                 </div>
             </div>
 
@@ -48,22 +51,36 @@
                  <textarea id="custom_terms" name="custom_terms" rows="5" placeholder="每行输入一个术语，例如：\nLLVM\nClang\nAPI"></textarea>
                  <p style="font-size: 0.85em; color: #666;">输入您希望在翻译中保持不变的特定术语或专有名词。</p>
              </div>
-            
-            <button type="submit" class="submit-btn">开始翻译</button>
+
         </form>
-        
+
+        <!-- Area to display task status -->
+        <div id="task-status-area" class="task-status-area" style="margin-top: 20px;">
+            <h2>任务状态</h2>
+            <ul id="task-list">
+                <!-- Task items will be added here by JavaScript -->
+            </ul>
+        </div>
+
+        <!-- Moved button group below task list -->
+        <div class="button-group" style="margin-top: 20px;">
+             <button type="button" id="submit-stream-btn" class="submit-btn">实时翻译 (单文件)</button>
+             <button type="button" id="submit-background-btn" class="submit-btn background-btn">提交后台任务</button>
+        </div>
+
         <div class="info-box">
             <h3>使用说明：</h3>
             <ul>
-                <li>支持标准SRT格式字幕文件</li>
+                <li>支持标准SRT格式字幕文件，可一次选择多个文件提交后台任务。</li>
                 <li>文件名会影响翻译质量，请使用包含视频主题的文件名（例如：LLVM_Tutorial.srt）</li>
-                <li>选择流式翻译可实时查看翻译进度</li>
+                <li>选择“实时翻译”可实时查看翻译进度（仅支持单个文件）。</li>
+                <li>选择“提交后台任务”可提交一个或多个文件进行翻译，稍后查看结果。</li>
                 <li>翻译采用xAI Grok模型，能精确保留技术术语</li>
                 <li>大型字幕文件可能需要较长时间</li>
             </ul>
         </div>
     </div>
-    
+
     <script src="{{ url_for('static', path='/js/script.js') }}"></script>
 </body>
 </html>

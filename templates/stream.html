@@ -153,32 +153,78 @@
             white-space: pre-wrap; /* 保留换行符 */
             word-wrap: break-word;
         }
+        /* Stream Setup Section */
+        #stream-setup {
+            padding: 20px;
+            border: 1px dashed #ccc;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            background-color: #fdfdfd;
+        }
+        #stream-setup label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        #stream-setup input[type="file"] {
+            display: block; /* Make file input visible */
+            margin-bottom: 15px;
+        }
+        #start-stream-btn {
+            padding: 10px 15px;
+            background-color: #5cb85c;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #start-stream-btn:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #stream-setup-status {
+            margin-top: 10px;
+            font-style: italic;
+            color: #666;
+        }
+        /* Hide translation sections initially */
+        #translation-progress, #terms-section, #current-subtitle-section, #completed-translations, #final-srt-container, #debug-section {
+            display: none;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>实时翻译</h1>
-        <p>正在处理文件: <strong>{{ filename }}</strong></p>
-        <p>显示模式: <strong>{{ display_mode }}</strong></p>
 
-        <!-- Hidden inputs to pass data to JavaScript -->
-        <input type="hidden" id="filename" value="{{ filename }}">
-        <input type="hidden" id="display-mode" value="{{ display_mode }}">
-        <textarea id="srt-content" style="display:none;">{{ srt_content }}</textarea>
-        <textarea id="custom-terms" style="display:none;">{{ custom_terms }}</textarea> <!-- Add hidden custom terms -->
-
-        <div id="status">准备开始...</div>
-        <div id="progress-info"></div>
-        <div class="progress-bar-container">
-            <div id="progress-bar" class="progress-bar">0%</div>
+        <!-- Section for re-selecting the file -->
+        <div id="stream-setup">
+            <h2>开始翻译</h2>
+            <p>文件名: <strong id="stream-filename-display">未知</strong></p>
+            <p>显示模式: <strong id="stream-display-mode-display">未知</strong></p>
+            <p>自定义术语: <strong id="stream-custom-terms-display">无</strong></p>
+            <hr style="margin: 15px 0;">
+            <label for="stream-file-input">请重新选择您之前选择的 SRT 文件:</label>
+            <input type="file" id="stream-file-input" accept=".srt">
+            <button id="start-stream-btn" disabled>开始翻译</button>
+            <div id="stream-setup-status">请选择文件以开始。</div>
         </div>
 
-        <div id="terms-section" style="display: none;">
+        <!-- Sections for displaying translation progress and results (initially hidden) -->
+        <div id="translation-progress">
+            <div id="status">准备开始...</div>
+            <div id="progress-info"></div>
+            <div class="progress-bar-container">
+                <div id="progress-bar" class="progress-bar">0%</div>
+            </div>
+        </div>
+
+        <div id="terms-section">
             <h2>提取的术语</h2>
             <div id="terms-list"></div>
         </div>
 
-        <div id="current-subtitle-section" class="subtitle-info" style="display: none;">
+        <div id="current-subtitle-section" class="subtitle-info">
             <h2>当前处理字幕</h2>
             <p><strong>序号:</strong> <span id="current-index"></span></p>
             <p><strong>时间:</strong> <span id="current-time"></span></p>
@@ -188,15 +234,14 @@
             <pre id="current-translation" style="min-height: 3em; background-color: #e0f2f7;"></pre>
         </div>
 
-        <!-- 新增：实时显示已完成翻译的区域 -->
-        <div id="completed-translations" style="display: none;">
+        <div id="completed-translations">
              <h2>实时翻译结果</h2>
              <div id="completed-translations-list">
                  <!-- 已完成的翻译条目将在这里动态添加 -->
              </div>
          </div>
 
-        <div id="final-srt-container" style="display: none;">
+        <div id="final-srt-container">
             <h2>完整翻译结果 (SRT 格式)</h2>
             <textarea id="final-srt" readonly></textarea>
              <form action="/download" method="post" style="margin-top: 10px;">
@@ -206,15 +251,27 @@
              </form>
         </div>
 
-        <div style="display: flex; align-items: center; justify-content: space-between;">
-             <h2>调试控制台</h2>
-             <button id="toggle-debug-btn" style="padding: 3px 8px; font-size: 0.85em; cursor: pointer;">显示</button>
+        <div id="debug-section">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                 <h2>调试控制台</h2>
+                 <button id="toggle-debug-btn" style="padding: 3px 8px; font-size: 0.85em; cursor: pointer;">显示</button>
+            </div>
+            <div id="debug-console" style="display: none;"></div> <!-- 默认隐藏 -->
         </div>
-        <div id="debug-console" style="display: none;"></div> <!-- 默认隐藏 -->
     </div>
 
     <script>
-        document.addEventListener('DOMContentLoaded', async function() {
+        document.addEventListener('DOMContentLoaded', function() {
+            // --- Element References ---
+            const streamSetupDiv = document.getElementById('stream-setup');
+            const streamFileInput = document.getElementById('stream-file-input');
+            const startStreamBtn = document.getElementById('start-stream-btn');
+            const streamSetupStatus = document.getElementById('stream-setup-status');
+            const streamFilenameDisplay = document.getElementById('stream-filename-display');
+            const streamDisplayModeDisplay = document.getElementById('stream-display-mode-display');
+            const streamCustomTermsDisplay = document.getElementById('stream-custom-terms-display');
+
+            const translationProgressDiv = document.getElementById('translation-progress');
             const statusDiv = document.getElementById('status');
             const progressInfoDiv = document.getElementById('progress-info');
             const progressBar = document.getElementById('progress-bar');
@@ -228,240 +285,305 @@
             const translationLoading = document.getElementById('translation-loading');
             const finalSrtContainer = document.getElementById('final-srt-container');
             const finalSrtTextarea = document.getElementById('final-srt');
-            const completedTranslationsDiv = document.getElementById('completed-translations'); // 获取新区域的引用
-            const completedTranslationsList = document.getElementById('completed-translations-list'); // 获取列表容器的引用
+            const completedTranslationsDiv = document.getElementById('completed-translations');
+            const completedTranslationsList = document.getElementById('completed-translations-list');
+            const debugSection = document.getElementById('debug-section');
             const debugConsole = document.getElementById('debug-console');
-
+            const toggleDebugBtn = document.getElementById('toggle-debug-btn');
             const downloadText = document.getElementById('download-text');
             const downloadFilename = document.getElementById('download-filename');
-// 调试控制台切换按钮逻辑
-const toggleDebugBtn = document.getElementById('toggle-debug-btn');
-if (toggleDebugBtn && debugConsole) {
-    toggleDebugBtn.addEventListener('click', function() {
-        const isHidden = debugConsole.style.display === 'none';
-        debugConsole.style.display = isHidden ? 'block' : 'none';
-        toggleDebugBtn.textContent = isHidden ? '隐藏' : '显示';
-    });
-}
 
-// 从隐藏元素获取数据
-const filename = document.getElementById('filename').value;
-const displayMode = document.getElementById('display-mode').value;
-const srtContent = document.getElementById('srt-content').value;
-const customTerms = document.getElementById('custom-terms').value; // Get custom terms
-// Removed duplicate declaration on the next line
+            let srtFileContent = null; // To store file content after selection
+            let originalFilename = 'unknown.srt'; // Default filename
+            let displayMode = 'only_translated'; // Default display mode
+            let customTerms = ''; // Default custom terms
 
+            // --- Debug Logging ---
             function logToDebug(type, message, rawData = null) {
+                if (!debugConsole) return;
                 const entry = document.createElement('div');
                 entry.classList.add('debug-entry');
-
                 const time = new Date().toLocaleTimeString();
                 const timeSpan = document.createElement('span');
                 timeSpan.classList.add('debug-time');
                 timeSpan.textContent = `[${time}]`;
                 entry.appendChild(timeSpan);
-
                 const messageSpan = document.createElement('span');
-                if (type === 'error') {
-                    messageSpan.classList.add('debug-error');
-                } else if (type === 'info') {
-                     messageSpan.classList.add('debug-info');
+                if (type === 'error') messageSpan.classList.add('debug-error');
+                else if (type === 'info') messageSpan.classList.add('debug-info');
+                messageSpan.textContent = ` ${message}`;
+                entry.appendChild(messageSpan);
+                if (rawData) {
+                    const rawSpan = document.createElement('span');
+                    rawSpan.classList.add('debug-raw');
+                    try { rawSpan.textContent = ` | Data: ${JSON.stringify(rawData)}`; }
+                    catch (e) { rawSpan.textContent = ` | Data: (Unserializable)`; }
+                    entry.appendChild(rawSpan);
                 }
-                 messageSpan.textContent = ` ${message}`;
-                 entry.appendChild(messageSpan);
-
-                 if (rawData) {
-                     const rawSpan = document.createElement('span');
-                     rawSpan.classList.add('debug-raw');
-                     rawSpan.textContent = ` | Data: ${JSON.stringify(rawData)}`;
-                     entry.appendChild(rawSpan);
-                 }
-
                 debugConsole.appendChild(entry);
-
-                // Keep only the latest 15 entries
-                while (debugConsole.children.length > 15) {
+                while (debugConsole.children.length > 50) { // Limit log entries
                     debugConsole.removeChild(debugConsole.firstChild);
                 }
-
-                debugConsole.scrollTop = debugConsole.scrollHeight; // Auto-scroll
+                debugConsole.scrollTop = debugConsole.scrollHeight;
             }
 
-            logToDebug('info', '页面加载完成，准备发起翻译请求。');
+            // --- Initial Setup ---
+            function initializeStreamPage() {
+                logToDebug('info', 'Initializing stream page.');
+                try {
+                    originalFilename = sessionStorage.getItem('streamFilename') || '未知文件';
+                    displayMode = sessionStorage.getItem('streamDisplayMode') || 'only_translated';
+                    customTerms = sessionStorage.getItem('streamCustomTerms') || '';
 
-            if (!srtContent || !filename || !displayMode) {
-                 statusDiv.textContent = '错误：无法获取翻译所需的数据。';
-                 logToDebug('error', '未能从页面获取 filename, displayMode, 或 srtContent。');
-                 return;
-             }
+                    streamFilenameDisplay.textContent = originalFilename;
+                    streamDisplayModeDisplay.textContent = displayMode;
+                    streamCustomTermsDisplay.textContent = customTerms || '无';
 
-            // 准备 FormData
-            const formData = new FormData();
-            const blob = new Blob([srtContent], { type: 'text/plain' });
-            formData.append('file', blob, filename); // 将SRT内容作为Blob发送
-            formData.append('display_mode', displayMode);
-            if (customTerms) { // Add custom terms if they exist
-                formData.append('custom_terms', customTerms);
+                    logToDebug('info', `Retrieved from sessionStorage: filename=${originalFilename}, displayMode=${displayMode}, customTerms=${customTerms}`);
+
+                    // Clear sessionStorage after reading to prevent reuse on refresh if needed
+                    // sessionStorage.removeItem('streamFilename');
+                    // sessionStorage.removeItem('streamDisplayMode');
+                    // sessionStorage.removeItem('streamCustomTerms');
+
+                } catch (e) {
+                    logToDebug('error', 'Failed to read data from sessionStorage.', e);
+                    streamSetupStatus.textContent = '错误：无法从之前的页面获取设置。请返回重试。';
+                    streamSetupStatus.style.color = 'red';
+                    startStreamBtn.disabled = true;
+                }
             }
 
-            logToDebug('info', 'FormData准备完毕，即将发送请求到 /api/translate-stream');
+            // --- File Input Handling ---
+            if (streamFileInput && startStreamBtn) {
+                streamFileInput.addEventListener('change', function(event) {
+                    const file = event.target.files[0];
+                    if (file) {
+                        // Basic check: ensure the selected filename matches the expected one
+                        if (file.name !== originalFilename) {
+                             streamSetupStatus.textContent = `警告：您选择的文件 (${file.name}) 与之前选择的文件 (${originalFilename}) 名称不符。请确保选择正确的文件。`;
+                             streamSetupStatus.style.color = 'orange';
+                             startStreamBtn.disabled = true; // Keep disabled if name mismatch
+                             srtFileContent = null;
+                             return; // Don't proceed if filename doesn't match
+                        }
 
-            try {
-                const response = await fetch('/api/translate-stream', {
-                    method: 'POST',
-                    body: formData
+                        const reader = new FileReader();
+                        reader.onload = function(e) {
+                            srtFileContent = e.target.result;
+                            startStreamBtn.disabled = false; // Enable button only after reading
+                            streamSetupStatus.textContent = `文件 "${file.name}" 已准备好，可以开始翻译。`;
+                            streamSetupStatus.style.color = 'green';
+                            logToDebug('info', `File "${file.name}" read successfully.`);
+                        };
+                        reader.onerror = function(e) {
+                            logToDebug('error', 'Error reading file.', e);
+                            streamSetupStatus.textContent = '错误：读取文件失败。';
+                            streamSetupStatus.style.color = 'red';
+                            startStreamBtn.disabled = true;
+                            srtFileContent = null;
+                        };
+                        reader.readAsText(file); // Read file content
+                    } else {
+                        startStreamBtn.disabled = true;
+                        streamSetupStatus.textContent = '请选择文件以开始。';
+                        streamSetupStatus.style.color = '#666';
+                        srtFileContent = null;
+                    }
                 });
-
-                logToDebug('info', `收到响应状态: ${response.status}`);
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`服务器错误: ${response.status} - ${errorText}`);
-                }
-
-                if (!response.body) {
-                    throw new Error('响应体不可读');
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder('utf-8');
-                let buffer = '';
-                let accumulatedSrt = '';
-                let currentTranslationText = ''; // 用于累积当前字幕的翻译块
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        logToDebug('info', '流读取完成。');
-                        break;
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop(); // 保留可能不完整的最后一行
-
-                    for (const line of lines) {
-                        if (line.trim() === '') continue;
-                        logToDebug('raw', '收到原始数据:', line);
-                        try {
-                            const data = JSON.parse(line);
-                            logToDebug('info', `处理事件: ${data.type}`, data);
-
-                            switch (data.type) {
-                                case 'info':
-                                    statusDiv.textContent = data.message;
-                                    break;
-                                case 'terms':
-                                    termsSection.style.display = 'block';
-                                    const ul = document.createElement('ul');
-                                    data.terms.forEach(term => {
-                                        const li = document.createElement('li');
-                                        li.textContent = term;
-                                        ul.appendChild(li);
-                                    });
-                                    termsListDiv.innerHTML = ''; // Clear previous
-                                    termsListDiv.appendChild(ul);
-                                    break;
-                                case 'progress':
-                                    progressInfoDiv.textContent = `进度: ${data.current} / ${data.total}`;
-                                    const percent = data.percent || 0;
-                                    progressBar.style.width = `${percent}%`;
-                                    progressBar.textContent = `${percent}%`;
-                                    break;
-                                case 'current':
-                                    currentSubtitleSection.style.display = 'block';
-                                    currentIndexSpan.textContent = data.index;
-                                    currentTimeSpan.textContent = data.time;
-                                    currentOriginalPre.textContent = data.text;
-                                    currentTranslationPre.textContent = ''; // 清空上一条的翻译
-                                    currentTranslationText = ''; // 重置累积翻译
-                                    translationLoading.style.display = 'inline-block'; // 显示加载点
-                                    break;
-                                case 'translation_chunk':
-                                    // 注意：后端似乎在每个chunk发送的是累积结果，而不是增量
-                                    // 所以我们直接显示最新收到的块
-                                    currentTranslationText = data.text; // 更新累积文本
-                                    currentTranslationPre.textContent = currentTranslationText;
-                                    translationLoading.style.display = 'none'; // 收到块就隐藏加载点
-                                    break;
-                                case 'translation_complete':
-                                    // 1. 更新当前处理字幕区域的最终译文
-                                    currentTranslationPre.textContent = data.translated;
-                                    translationLoading.style.display = 'none'; // 最终完成，隐藏加载点
-
-                                    // 2. 在实时结果列表中添加新条目
-                                    completedTranslationsDiv.style.display = 'block'; // 确保区域可见
-                                    const entryDiv = document.createElement('div');
-                                    entryDiv.classList.add('completed-entry');
-
-                                    const timeSpan = document.createElement('span');
-                                    timeSpan.classList.add('completed-time');
-                                    timeSpan.textContent = data.time; // 显示时间轴
-
-                                    const textSpan = document.createElement('span');
-                                    textSpan.classList.add('completed-text');
-
-                                    // 根据 displayMode 设置显示的文本内容
-                                    if (displayMode === "only_translated") {
-                                        textSpan.textContent = data.translated;
-                                    } else if (displayMode === "original_above_translated") {
-                                        // 使用 pre-wrap，换行符 '\n' 会生效
-                                        textSpan.textContent = data.original + '\n' + data.translated;
-                                    } else if (displayMode === "translated_above_original") {
-                                        // 使用 pre-wrap，换行符 '\n' 会生效
-                                        textSpan.textContent = data.translated + '\n' + data.original;
-                                    } else {
-                                        textSpan.textContent = data.translated; // 默认为仅显示翻译
-                                    }
-
-                                    entryDiv.appendChild(timeSpan);
-                                    entryDiv.appendChild(textSpan);
-                                    completedTranslationsList.appendChild(entryDiv);
-
-                                    // 3. 自动滚动实时结果列表到底部
-                                    completedTranslationsList.scrollTop = completedTranslationsList.scrollHeight;
-
-                                    break;
-                                case 'srt':
-                                    accumulatedSrt += data.text;
-                                    finalSrtTextarea.value = accumulatedSrt; // 实时更新最终结果
-                                    finalSrtTextarea.scrollTop = finalSrtTextarea.scrollHeight; // 滚动到底部
-                                    break;
-                                case 'complete':
-                                    statusDiv.textContent = data.message;
-                                    finalSrtContainer.style.display = 'block';
-                                    progressBar.style.width = '100%';
-                                    progressBar.textContent = '100%';
-                                    progressInfoDiv.textContent = `翻译完成! 共 ${progressBar.dataset.total || '?'} 条字幕`;
-                                    // 更新下载链接的内容
-                                    downloadText.value = accumulatedSrt;
-                                    downloadFilename.value = `translated_${filename}`;
-                                    break;
-                                case 'error':
-                                     statusDiv.textContent = `错误: ${data.message}`;
-                                     statusDiv.style.color = 'red';
-                                     logToDebug('error', `收到后端错误: ${data.message}`);
-                                     break;
-                                default:
-                                     logToDebug('warn', `收到未知事件类型: ${data.type}`, data);
-                             }
-                         } catch (e) {
-                             logToDebug('error', `处理接收到的数据时出错: ${e.message}`, line);
-                         }
-                    }
-                }
-                 // 处理可能残留在buffer中的最后数据
-                 if (buffer.trim()) {
-                     logToDebug('warn', '流结束后缓冲区仍有数据:', buffer);
-                     // 可以在这里尝试最后一次解析 buffer
-                 }
-
-            } catch (error) {
-                statusDiv.textContent = `发生错误: ${error.message}`;
-                statusDiv.style.color = 'red';
-                logToDebug('error', `Fetch 请求或流处理失败: ${error.message}`);
-                console.error('翻译流错误:', error);
             }
+
+            // --- Start Translation Button ---
+            if (startStreamBtn) {
+                startStreamBtn.addEventListener('click', async function() {
+                    if (!srtFileContent) {
+                        alert('错误：未能读取文件内容，请重新选择文件。');
+                        logToDebug('error', 'Start button clicked but srtFileContent is null.');
+                        return;
+                    }
+
+                    logToDebug('info', '开始翻译按钮被点击。');
+                    startStreamBtn.disabled = true;
+                    startStreamBtn.textContent = '正在启动...';
+                    streamSetupDiv.style.display = 'none'; // Hide setup section
+                    translationProgressDiv.style.display = 'block'; // Show progress section
+                    debugSection.style.display = 'block'; // Show debug section
+
+                    // Prepare FormData for the API request
+                    const formData = new FormData();
+                    const blob = new Blob([srtFileContent], { type: 'text/plain' });
+                    formData.append('file', blob, originalFilename);
+                    formData.append('display_mode', displayMode);
+                    if (customTerms) {
+                        formData.append('custom_terms', customTerms);
+                    }
+
+                    logToDebug('info', 'FormData准备完毕，即将发送请求到 /api/translate-stream');
+
+                    // --- Start EventSource Handling ---
+                    try {
+                        const response = await fetch('/api/translate-stream', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        logToDebug('info', `收到响应状态: ${response.status}`);
+
+                        if (!response.ok) {
+                            const errorText = await response.text();
+                            throw new Error(`服务器错误: ${response.status} - ${errorText}`);
+                        }
+                        if (!response.body) {
+                            throw new Error('响应体不可读');
+                        }
+
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder('utf-8');
+                        let buffer = '';
+                        let accumulatedSrt = '';
+                        let currentTranslationText = '';
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) {
+                                logToDebug('info', '流读取完成。');
+                                break;
+                            }
+
+                            buffer += decoder.decode(value, { stream: true });
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop(); // Keep potentially incomplete last line
+
+                            for (const line of lines) {
+                                if (line.trim() === '') continue;
+                                logToDebug('raw', '收到原始数据:', line);
+                                try {
+                                    const data = JSON.parse(line);
+                                    logToDebug('info', `处理事件: ${data.type}`, data);
+
+                                    switch (data.type) {
+                                        case 'info':
+                                            statusDiv.textContent = data.message;
+                                            break;
+                                        case 'terms':
+                                            termsSection.style.display = 'block';
+                                            const ul = document.createElement('ul');
+                                            data.terms.forEach(term => {
+                                                const li = document.createElement('li');
+                                                li.textContent = term;
+                                                ul.appendChild(li);
+                                            });
+                                            termsListDiv.innerHTML = ''; // Clear previous
+                                            termsListDiv.appendChild(ul);
+                                            break;
+                                        case 'progress':
+                                            progressInfoDiv.textContent = `进度: ${data.current} / ${data.total}`;
+                                            progressBar.dataset.total = data.total; // Store total for later
+                                            const percent = data.percent || 0;
+                                            progressBar.style.width = `${percent}%`;
+                                            progressBar.textContent = `${percent}%`;
+                                            break;
+                                        case 'current':
+                                            currentSubtitleSection.style.display = 'block';
+                                            currentIndexSpan.textContent = data.index;
+                                            currentTimeSpan.textContent = data.time;
+                                            currentOriginalPre.textContent = data.text;
+                                            currentTranslationPre.textContent = ''; // Clear previous translation
+                                            currentTranslationText = ''; // Reset accumulator
+                                            translationLoading.style.display = 'inline-block';
+                                            break;
+                                        case 'translation_chunk':
+                                            currentTranslationText = data.text; // Assume backend sends cumulative chunks
+                                            currentTranslationPre.textContent = currentTranslationText;
+                                            translationLoading.style.display = 'none';
+                                            break;
+                                        case 'translation_complete':
+                                            currentTranslationPre.textContent = data.translated;
+                                            translationLoading.style.display = 'none';
+                                            completedTranslationsDiv.style.display = 'block';
+                                            const entryDiv = document.createElement('div');
+                                            entryDiv.classList.add('completed-entry');
+                                            const timeSpan = document.createElement('span');
+                                            timeSpan.classList.add('completed-time');
+                                            timeSpan.textContent = data.time;
+                                            const textSpan = document.createElement('span');
+                                            textSpan.classList.add('completed-text');
+                                            if (displayMode === "only_translated") textSpan.textContent = data.translated;
+                                            else if (displayMode === "original_above_translated") textSpan.textContent = data.original + '\n' + data.translated;
+                                            else if (displayMode === "translated_above_original") textSpan.textContent = data.translated + '\n' + data.original;
+                                            else textSpan.textContent = data.translated;
+                                            entryDiv.appendChild(timeSpan);
+                                            entryDiv.appendChild(textSpan);
+                                            completedTranslationsList.appendChild(entryDiv);
+                                            completedTranslationsList.scrollTop = completedTranslationsList.scrollHeight;
+                                            break;
+                                        case 'srt':
+                                            accumulatedSrt += data.text;
+                                            finalSrtTextarea.value = accumulatedSrt;
+                                            finalSrtTextarea.scrollTop = finalSrtTextarea.scrollHeight;
+                                            break;
+                                        case 'complete':
+                                            statusDiv.textContent = data.message;
+                                            finalSrtContainer.style.display = 'block';
+                                            progressBar.style.width = '100%';
+                                            progressBar.textContent = '100%';
+                                            progressInfoDiv.textContent = `翻译完成! 共 ${progressBar.dataset.total || '?'} 条字幕`;
+                                            downloadText.value = accumulatedSrt;
+                                            // New filename logic: basename-ch.srt
+                                            let baseName = originalFilename || 'stream_result';
+                                            const lastDotIndex = baseName.lastIndexOf('.');
+                                            if (lastDotIndex > 0) {
+                                                baseName = baseName.substring(0, lastDotIndex);
+                                            }
+                                            let newFilename = `${baseName}-ch.srt`;
+                                            // Basic sanitization (remove slashes)
+                                            newFilename = newFilename.replace(/[/\\]/g, '_');
+                                            downloadFilename.value = newFilename;
+                                            break;
+                                        case 'error':
+                                             statusDiv.textContent = `错误: ${data.message}`;
+                                             statusDiv.style.color = 'red';
+                                             logToDebug('error', `收到后端错误: ${data.message}`);
+                                             break;
+                                        default:
+                                             logToDebug('warn', `收到未知事件类型: ${data.type}`, data);
+                                     }
+                                } catch (e) {
+                                    logToDebug('error', `处理接收到的数据时出错: ${e.message}`, line);
+                                }
+                            }
+                        }
+                         // Handle any remaining data in buffer
+                         if (buffer.trim()) {
+                             logToDebug('warn', '流结束后缓冲区仍有数据:', buffer);
+                         }
+
+                    } catch (error) {
+                        statusDiv.textContent = `发生错误: ${error.message}`;
+                        statusDiv.style.color = 'red';
+                        logToDebug('error', `Fetch 请求或流处理失败: ${error.message}`);
+                        console.error('翻译流错误:', error);
+                        // Re-enable button and show setup on error
+                        startStreamBtn.disabled = false;
+                        startStreamBtn.textContent = '开始翻译';
+                        streamSetupDiv.style.display = 'block';
+                        translationProgressDiv.style.display = 'none';
+                    }
+                    // --- End EventSource Handling ---
+                });
+            }
+
+            // --- Debug Console Toggle ---
+            if (toggleDebugBtn && debugConsole) {
+                toggleDebugBtn.addEventListener('click', function() {
+                    const isHidden = debugConsole.style.display === 'none';
+                    debugConsole.style.display = isHidden ? 'block' : 'none';
+                    toggleDebugBtn.textContent = isHidden ? '隐藏' : '显示';
+                });
+            }
+
+            // --- Initialize Page ---
+            initializeStreamPage();
         });
     </script>
 </body>

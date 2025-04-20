@@ -370,3 +370,142 @@ input[type="file"] {
         flex: 1;
     }
 }
+/* 按钮组 */
+.button-group {
+    display: flex;
+    gap: 15px; /* 按钮之间的间距 */
+    margin-top: 20px;
+}
+
+.button-group .submit-btn {
+    flex: 1; /* 让按钮平分空间 */
+    width: auto; /* 覆盖之前的 width: 100% */
+}
+
+.background-btn {
+    background-color: #f39c12; /* 橙色背景 */
+}
+
+.background-btn:hover {
+    background-color: #e67e22;
+}
+
+
+/* 任务状态区域 */
+.task-status-area {
+    margin-top: 30px;
+    padding: 20px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    background-color: #fdfdfd;
+}
+
+.task-status-area h2 {
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eee;
+    color: #2c3e50;
+    font-size: 1.3em;
+}
+
+#task-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+#task-list li {
+    background-color: #fff;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    padding: 15px;
+    margin-bottom: 15px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 15px; /* 行间距和列间距 */
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+#task-list li .filename {
+    font-weight: bold;
+    color: #34495e;
+    flex-basis: 100%; /* 文件名占满第一行 */
+    margin-bottom: 5px;
+}
+
+#task-list li .status {
+    font-size: 0.9em;
+    padding: 3px 8px;
+    border-radius: 12px;
+    color: white;
+    min-width: 70px; /* 给状态标签一个最小宽度 */
+    text-align: center;
+}
+
+.status.pending { background-color: #95a5a6; } /* 灰色 */
+.status.processing { background-color: #3498db; } /* 蓝色 */
+.status.completed { background-color: #2ecc71; } /* 绿色 */
+.status.failed { background-color: #e74c3c; } /* 红色 */
+
+.progress-bar-container {
+    flex-grow: 1; /* 占据剩余空间 */
+    height: 10px;
+    background-color: #ecf0f1;
+    border-radius: 5px;
+    overflow: hidden;
+    min-width: 150px; /* 避免进度条过窄 */
+}
+
+.progress-bar {
+    height: 100%;
+    background-color: #3498db; /* 默认蓝色 */
+    width: 0%;
+    transition: width 0.5s ease;
+    border-radius: 5px;
+}
+
+.progress-text {
+    font-size: 0.9em;
+    color: #555;
+    min-width: 35px; /* 避免百分比换行 */
+    text-align: right;
+}
+
+.result-area, .error-area {
+    flex-basis: 100%; /* 占满整行 */
+    margin-top: 10px;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    display: none; /* Initially hidden */
+}
+
+.result-area {
+    background-color: #e8f5e9; /* Light green */
+    border: 1px solid #c8e6c9;
+}
+
+.error-area {
+    background-color: #ffebee; /* Light red */
+    border: 1px solid #ffcdd2;
+    color: #c62828; /* Darker red text */
+    white-space: pre-wrap; /* Preserve error formatting */
+}
+
+#task-list li .download-btn {
+    background-color: #1abc9c; /* 青色 */
+    color: white;
+    border: none;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85em;
+    transition: background-color 0.3s;
+    display: none; /* Initially hidden */
+    margin-left: auto; /* 推到右边 */
+}
+
+#task-list li .download-btn:hover {
+    background-color: #16a085;
+}
